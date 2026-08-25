@@ -83,8 +83,29 @@ config ZMK_STUDIO_TRANSPORT_BLE_PREF_LATENCY
 
 endmenu
 
+config ZMK_STUDIO_TORABO_TUNNEL
+    bool "Torabo settings tunnel"
+    default n
+    help
+      Add a generic RPC subsystem that carries opaque wire blobs for torabo-tsuki
+      features (trackball, trackpad, macros, ...), so the same settings reachable
+      over the custom BLE GATT services are also reachable over the Studio RPC
+      transport (USB serial included). Features register with
+      TORABO_TUNNEL_FEATURE() from <zmk/studio/torabo_tunnel.h>.
+
+config ZMK_STUDIO_TORABO_TUNNEL_BLOB_MAX_SIZE
+    int "Torabo tunnel maximum blob size"
+    default 2048 if ZMK_STUDIO_TORABO_TUNNEL
+    default 8
+    help
+      Statically sizes the tunnel request blob in the generated protobuf structs
+      and the read staging buffer. The default covers the largest wire blob in
+      use (macros, 1624 bytes). Kept tiny when the tunnel is disabled so
+      zmk_studio_Request keeps its stock size.
+
 config ZMK_STUDIO_RPC_THREAD_STACK_SIZE
     int "RPC Thread Stack Size"
+    default 8192 if ZMK_STUDIO_TORABO_TUNNEL
     default 4096
 
 config ZMK_STUDIO_RPC_RX_BUF_SIZE
