@@ -212,6 +212,14 @@ exit:
     return 0;
 }
 
+int zmk_rpc_send_notification(const zmk_studio_Notification *n) {
+    zmk_studio_Response resp = zmk_studio_Response_init_zero;
+    resp.which_type = zmk_studio_Response_notification_tag;
+    resp.type.notification = *n;
+
+    return send_response(&resp);
+}
+
 static void rpc_main(void) {
     for (;;) {
         pb_istream_t stream = pb_istream_for_rx_ring_buf();

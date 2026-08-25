@@ -219,6 +219,19 @@ struct ring_buf *zmk_rpc_get_tx_buf(void);
 struct ring_buf *zmk_rpc_get_rx_buf(void);
 void zmk_rpc_rx_notify(void);
 
+/**
+ * @brief Encode and send a notification on the calling thread.
+ *
+ * Raising a zmk_studio_rpc_notification event is the usual way to reach the
+ * client, but every listener of that event then runs for each notification. A
+ * high-rate producer that already owns a suitable thread can call this instead,
+ * which only takes the transport lock and encodes.
+ *
+ * @note Blocks while the transport drains, so never call it from an ISR or from
+ *       a context the keyboard's input path depends on.
+ */
+int zmk_rpc_send_notification(const zmk_studio_Notification *n);
+
 #define ZMK_RPC_TRANSPORT(name, _transport, _rx_start, _rx_stop, _tx_user_data, _tx_notify)        \
     STRUCT_SECTION_ITERABLE(zmk_rpc_transport, name) = {                                           \
         .transport = _transport,                                                                   \
