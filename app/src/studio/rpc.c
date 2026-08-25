@@ -119,6 +119,11 @@ RING_BUF_DECLARE(rpc_tx_buf, CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE);
 
 struct ring_buf *zmk_rpc_get_tx_buf(void) { return &rpc_tx_buf; }
 
+/* Set while encoding a message the caller allowed us to throw away. Both are
+ * only ever touched while holding rpc_transport_mutex. */
+static bool tx_drop_when_full;
+static bool tx_dropped;
+
 static bool rpc_tx_buffer_write(pb_ostream_t *stream, const uint8_t *buf, size_t count) {
     void *user_data = stream->state;
     size_t written = 0;
@@ -131,6 +136,16 @@ static bool rpc_tx_buffer_write(pb_ostream_t *stream, const uint8_t *buf, size_t
         uint32_t claim_len = ring_buf_put_claim(&rpc_tx_buf, &write_buf, count - written);
 
         if (claim_len == 0) {
+            /* Nothing claimable means the transport has not drained what we
+             * already wrote. Spinning here is what wedges the calling thread when
+             * nobody is reading the other end, so a droppable message gives up
+             * instead. The partial frame left behind is the price; the receiver
+             * resynchronises on the next SOF, and by definition nobody is reading
+             * this one anyway. */
+            if (tx_drop_when_full) {
+                tx_dropped = true;
+                return false;
+            }
             continue;
         }
 
@@ -176,7 +191,7 @@ static pb_ostream_t pb_ostream_for_tx_buf(void *user_data) {
     return stream;
 }
 
-static int send_response(const zmk_studio_Response *resp) {
+static int send_response(const zmk_studio_Response *resp, bool drop_when_full) {
     int ret = 0;
 
     k_mutex_lock(&rpc_transport_mutex, K_FOREVER);
@@ -184,6 +199,9 @@ static int send_response(const zmk_studio_Response *resp) {
     if (!selected_transport) {
         goto exit;
     }
+
+    tx_drop_when_full = drop_when_full;
+    tx_dropped = false;
 
     void *user_data = selected_transport->tx_user_data ? selected_transport->tx_user_data() : NULL;
 
@@ -196,6 +214,13 @@ static int send_response(const zmk_studio_Response *resp) {
 
     /* Now we are ready to encode the message! */
     bool status = pb_encode(&stream, &zmk_studio_Response_msg, resp);
+
+    tx_drop_when_full = false;
+
+    if (tx_dropped) {
+        ret = -EAGAIN;
+        goto exit;
+    }
 
     if (!status) {
 #if !IS_ENABLED(CONFIG_NANOPB_NO_ERRMSG)
@@ -215,12 +240,31 @@ exit:
     return ret;
 }
 
+/* How long a notification waits for the queue ahead of it to clear before it is
+ * given up on. A healthy transport drains a message in microseconds, so this only
+ * ever elapses when nothing is reading the other end. */
+#define RPC_NOTIFICATION_DRAIN_WAIT_MS 10
+
 int zmk_rpc_send_notification(const zmk_studio_Notification *n) {
+    /* Bytes still queued mean the previous message has not reached the host. A
+     * brief wait tells two messages overlapping on a healthy link apart from a
+     * port nobody is reading, and starting only from an empty queue is what keeps
+     * a dropped notification from leaving a half-written frame behind — the
+     * mid-encode bail-out in rpc_tx_buffer_write is only the fallback for a link
+     * that dies between here and there. */
+    for (int i = 0; i < RPC_NOTIFICATION_DRAIN_WAIT_MS && !ring_buf_is_empty(&rpc_tx_buf); i++) {
+        k_sleep(K_MSEC(1));
+    }
+
+    if (!ring_buf_is_empty(&rpc_tx_buf)) {
+        return -EAGAIN;
+    }
+
     zmk_studio_Response resp = zmk_studio_Response_init_zero;
     resp.which_type = zmk_studio_Response_notification_tag;
     resp.type.notification = *n;
 
-    return send_response(&resp);
+    return send_response(&resp, true);
 }
 
 static void rpc_main(void) {
@@ -237,7 +281,7 @@ static void rpc_main(void) {
         if (status) {
             zmk_studio_Response resp = handle_request(&req);
 
-            int err = send_response(&resp);
+            int err = send_response(&resp, false);
 #if IS_ENABLED(CONFIG_THREAD_ANALYZER)
             thread_analyzer_print();
 #endif // IS_ENABLED(CONFIG_THREAD_ANALYZER)
@@ -336,7 +380,7 @@ static int studio_rpc_listener_cb(const zmk_event_t *eh) {
         zmk_studio_Response resp = zmk_studio_Response_init_zero;
         resp.which_type = zmk_studio_Response_notification_tag;
         resp.type.notification = rpc_notify->notification;
-        send_response(&resp);
+        send_response(&resp, false);
         return ZMK_EV_EVENT_BUBBLE;
     }
 

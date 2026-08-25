@@ -78,11 +78,24 @@ bool torabo_tunnel_subscribed(uint16_t feature_id);
 /**
  * @brief Push an unsolicited blob for the given feature to the connected client.
  *
- * @note Encodes and writes to the transport on the calling thread, and blocks
- *       while it drains. Call it from a dedicated work queue, never from an ISR,
- *       a ZMK event listener, or the system work queue.
+ * @note Encodes and writes to the transport on the calling thread, and may sleep
+ *       for a few milliseconds waiting for it. Call it from a dedicated work
+ *       queue, never from an ISR, a ZMK event listener, or the system work queue.
+ *
+ * @note DELIVERY IS BEST EFFORT. A push is dropped rather than waited on when
+ *       the transport is backed up, which is how a client that stopped reading —
+ *       a USB serial port closed while the cable stays plugged in — is kept from
+ *       stalling the producer. A feature that pushes must therefore be
+ *       recoverable from its READ: the client resynchronises by reading the
+ *       current state, exactly as it does on a fresh subscribe. A feature whose
+ *       pushes cannot be reconstructed that way does not belong on the tunnel.
+ *
+ *       Persistent dropping is taken as evidence the client is gone: after
+ *       enough in a row the subscription is cleared and the feature is told, as
+ *       if the client had disconnected.
  *
  * @retval -ENOTSUP if no client has subscribed to @p feature_id.
  * @retval -EMSGSIZE if @p len exceeds what a notification can carry.
+ * @retval -EAGAIN if the push was dropped because the transport is backed up.
  */
 int torabo_tunnel_notify(uint16_t feature_id, const uint8_t *buf, uint16_t len);

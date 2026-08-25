@@ -33,6 +33,14 @@ ZMK_RPC_SUBSYSTEM(torabo)
 /* Feature ids index a bitmask, so they have to stay inside one atomic word. */
 #define TUNNEL_MAX_FEATURE_ID 31
 
+/* Dropped pushes say the client stopped reading. One in isolation is normal
+ * enough to be worth only a throttled line; a run of them means nobody is there,
+ * and the subscription is dropped so the producer stops building records for it.
+ * At the live feed's rate a run this long is well under a second of typing, and
+ * the client only has to subscribe again — which re-sends a snapshot anyway. */
+#define TUNNEL_DROP_LOG_INTERVAL_MS 5000
+#define TUNNEL_DROP_RUN_LIMIT 64
+
 /* Staging area for a read response. Only ever touched from the single RPC
  * thread, between building the response and encoding it in send_response(). */
 static uint8_t tunnel_blob[CONFIG_ZMK_STUDIO_TORABO_TUNNEL_BLOB_MAX_SIZE];
@@ -41,6 +49,11 @@ static uint16_t tunnel_blob_len;
 /* Bit N set = a client asked feature N to push. Written from the RPC thread and
  * from the disconnect paths below, read from whichever thread produces a record. */
 static atomic_t subscriptions;
+
+/* Drop bookkeeping, touched from whichever threads push. */
+static atomic_t drops_since_log;
+static atomic_t drop_run;
+static atomic_t last_drop_log_ms;
 
 static bool encode_tunnel_blob(pb_ostream_t *stream, const pb_field_t *field, void *const *arg) {
     if (tunnel_blob_len == 0) {
@@ -76,6 +89,9 @@ static zmk_studio_Response tunnel_status(zmk_torabo_TunnelStatus status) {
  * never keep a producer pushing into a transport nobody is draining. */
 static void drop_all_subscriptions(void) {
     atomic_val_t was = atomic_clear(&subscriptions);
+
+    atomic_clear(&drop_run);
+
     if (was == 0) {
         return;
     }
@@ -104,6 +120,8 @@ static zmk_studio_Response set_subscribed(const struct torabo_tunnel_feature *fe
     }
 
     if (enabled) {
+        /* A fresh client should not inherit the run that unsubscribed the last one. */
+        atomic_clear(&drop_run);
         atomic_or(&subscriptions, BIT(feature->feature_id));
     } else {
         atomic_and(&subscriptions, ~BIT(feature->feature_id));
@@ -176,6 +194,39 @@ zmk_studio_Response tunnel(const zmk_studio_Request *req) {
 
 ZMK_RPC_SUBSYSTEM_HANDLER(torabo, tunnel, ZMK_STUDIO_RPC_HANDLER_UNSECURED);
 
+/* One push went nowhere. Report at a rate a log can survive, and take a long
+ * enough run as the client having gone away without saying so. */
+static void note_dropped_push(uint16_t feature_id) {
+    uint32_t total = (uint32_t)atomic_inc(&drops_since_log) + 1;
+    uint32_t now = k_uptime_get_32();
+
+    /* Unsigned arithmetic, so this stays right across the 32-bit wrap. */
+    if (now - (uint32_t)atomic_get(&last_drop_log_ms) >= TUNNEL_DROP_LOG_INTERVAL_MS) {
+        atomic_set(&last_drop_log_ms, (atomic_val_t)now);
+        atomic_clear(&drops_since_log);
+        LOG_WRN("Dropped %u tunnel notifications: nothing is reading the transport", total);
+    }
+
+    if (atomic_inc(&drop_run) + 1 < TUNNEL_DROP_RUN_LIMIT) {
+        return;
+    }
+
+    const struct torabo_tunnel_feature *feature = find_feature(feature_id);
+    if (!feature) {
+        return;
+    }
+
+    LOG_WRN("Feature 0x%02x dropped %d pushes in a row; unsubscribing it", feature_id,
+            TUNNEL_DROP_RUN_LIMIT);
+
+    atomic_clear(&drop_run);
+    atomic_and(&subscriptions, ~BIT(feature_id));
+
+    if (feature->subscribe) {
+        feature->subscribe(false);
+    }
+}
+
 int torabo_tunnel_notify(uint16_t feature_id, const uint8_t *buf, uint16_t len) {
     if (!torabo_tunnel_subscribed(feature_id)) {
         return -ENOTSUP;
@@ -195,7 +246,15 @@ int torabo_tunnel_notify(uint16_t feature_id, const uint8_t *buf, uint16_t len) 
 
     zmk_studio_Notification n = ZMK_RPC_NOTIFICATION(torabo, tunnel, notif);
 
-    return zmk_rpc_send_notification(&n);
+    int ret = zmk_rpc_send_notification(&n);
+
+    if (ret == -EAGAIN) {
+        note_dropped_push(feature_id);
+    } else {
+        atomic_clear(&drop_run);
+    }
+
+    return ret;
 }
 
 /* ---- reachability --------------------------------------------------------

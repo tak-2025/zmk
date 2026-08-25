@@ -220,15 +220,25 @@ struct ring_buf *zmk_rpc_get_rx_buf(void);
 void zmk_rpc_rx_notify(void);
 
 /**
- * @brief Encode and send a notification on the calling thread.
+ * @brief Encode and send a notification on the calling thread, dropping it if
+ *        the transport is not keeping up.
  *
  * Raising a zmk_studio_rpc_notification event is the usual way to reach the
  * client, but every listener of that event then runs for each notification. A
  * high-rate producer that already owns a suitable thread can call this instead,
  * which only takes the transport lock and encodes.
  *
- * @note Blocks while the transport drains, so never call it from an ISR or from
- *       a context the keyboard's input path depends on.
+ * Unlike a response, a notification is not worth waiting for: a client that
+ * stopped reading — a USB serial port closed while the cable stays plugged in,
+ * say — would otherwise hold the caller in the transport's write path
+ * indefinitely. So this waits only briefly for the queue to clear and then
+ * gives up. Producers must be able to tolerate a lost notification.
+ *
+ * @note May sleep for a few milliseconds, so never call it from an ISR or from a
+ *       context the keyboard's input path depends on.
+ *
+ * @retval -EAGAIN if the notification was dropped because the transport is
+ *         backed up.
  */
 int zmk_rpc_send_notification(const zmk_studio_Notification *n);
 
