@@ -4,6 +4,8 @@ manifest:
       url-base: https://github.com/zephyrproject-rtos
     - name: zmkfirmware
       url-base: https://github.com/zmkfirmware
+    - name: tak-2025
+      url-base: https://github.com/tak-2025
   projects:
     - name: zephyr
       remote: zmkfirmware
@@ -33,9 +35,12 @@ manifest:
       revision: 8c60555d6277a0360c876bd85d491fc4fb0cd74a
       path: modules/lib/nanopb
       remote: zmkfirmware
+    # torabo.proto (the settings tunnel) lives in this fork; upstream has no
+    # field for it, and ZMK_RPC_SUBSYSTEM needs the generated tag to exist.
+    # Tracks the branch rather than a commit so the two forks move together.
     - name: zmk-studio-messages
-      revision: 6cb4c283e76209d59c45fbcb218800cd19e9339d
+      revision: dev
       path: modules/msgs/zmk-studio-messages
-      remote: zmkfirmware
+      remote: tak-2025
   self:
     west-commands: scripts/west-commands.yml
