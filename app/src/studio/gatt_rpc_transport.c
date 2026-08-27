@@ -25,6 +25,12 @@ LOG_MODULE_DECLARE(zmk_studio, CONFIG_ZMK_STUDIO_LOG_LEVEL);
 
 static bool handling_rx = false;
 
+/* Milliseconds a single GATT write will wait, one at a time, for the RPC thread
+ * to make room before it gives up on the rest of the message. Reached only when
+ * the RX buffer cannot hold a whole request and the consumer is starved; a
+ * truncated request is bad, but it recovers, and spinning here does not. */
+#define RPC_RX_STALL_LIMIT 100
+
 static atomic_t notify_size;
 
 static void rpc_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value) {
@@ -68,6 +74,8 @@ static ssize_t write_rpc_req(struct bt_conn *conn, const struct bt_gatt_attr *at
 
     uint32_t copied = 0;
     struct ring_buf *rpc_buf = zmk_rpc_get_rx_buf();
+    int stalls = 0;
+
     while (copied < len) {
         uint8_t *buffer;
         uint32_t claim_len = ring_buf_put_claim(rpc_buf, &buffer, len - copied);
@@ -75,9 +83,31 @@ static ssize_t write_rpc_req(struct bt_conn *conn, const struct bt_gatt_attr *at
         if (claim_len > 0) {
             memcpy(buffer, ((uint8_t *)buf) + copied, claim_len);
             copied += claim_len;
+            stalls = 0;
         }
 
         ring_buf_put_finish(rpc_buf, claim_len);
+
+        if (claim_len == 0) {
+            /* No room: the RPC thread has not consumed what is already staged.
+             * Wake it now rather than only after the loop -- otherwise it never
+             * learns there is anything to read and this spins forever, taking
+             * the BT RX thread (and with it the whole BLE stack) down with it.
+             *
+             * Then sleep, not k_yield(): the RPC thread runs at a lower priority
+             * than this one, so yielding comes straight back here. Sleeping is
+             * safe in a GATT write callback -- it only pends BT RX, and what we
+             * are waiting for does not need BT RX to make progress. */
+            zmk_rpc_rx_notify();
+
+            if (++stalls > RPC_RX_STALL_LIMIT) {
+                LOG_ERR("Dropping incoming RPC byte, insufficient room in the RX buffer. Bump "
+                        "CONFIG_ZMK_STUDIO_RPC_RX_BUF_SIZE.");
+                break;
+            }
+
+            k_sleep(K_MSEC(1));
+        }
     }
 
     zmk_rpc_rx_notify();
