@@ -17,6 +17,7 @@
 #include <zephyr/sys/util.h>
 
 #include <zmk/debounce.h>
+#include <zmk/torabo_timing.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -244,8 +245,11 @@ static int kscan_matrix_read(const struct device *dev) {
                 return active;
             }
 
+            /* Torabo runtime timing: read the effective config here rather than
+             * caching it, so a value written over BLE applies from the very next
+             * scan. __weak default hands back &config->debounce_config unchanged. */
             zmk_debounce_update(&data->matrix_state[index], active, config->debounce_scan_period_ms,
-                                &config->debounce_config);
+                                zmk_torabo_debounce_effective(&config->debounce_config));
         }
 
         err = gpio_pin_set_dt(&out_gpio->spec, 0);

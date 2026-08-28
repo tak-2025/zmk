@@ -25,6 +25,23 @@ config ZMK_SPLIT_ROLE_CENTRAL
 config BT_L2CAP_TX_BUF_COUNT
     default 5 if ZMK_SPLIT_ROLE_CENTRAL
 
+config ZMK_SPLIT_BLE_DEBOUNCE_SYNC
+    bool "Propagate the kscan debounce windows to the peripherals (torabo)"
+    help
+      Adds a characteristic to the split service (ZMK_SPLIT_BT_UPDATE_DEBOUNCE_UUID)
+      that carries the two kscan debounce windows, so a value the app writes to
+      the central reaches the peripheral's key scanning too. Without it each half
+      keeps the debounce baked into its own devicetree.
+
+      Set on BOTH halves — the same symbol adds the characteristic on the
+      peripheral and the writer on the central. Nothing is stored on the
+      peripheral: the central re-sends on every connect.
+
+      Only the transport lives here. Where the numbers come from and what they
+      then do is the torabo timing module (<zmk/torabo_timing.h>); with this on
+      but that module absent, the central has nothing to send and the peripheral
+      does nothing with what it receives.
+
 if ZMK_SPLIT_ROLE_CENTRAL
 
 config ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS

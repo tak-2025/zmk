@@ -20,3 +20,9 @@
 #define ZMK_SPLIT_BT_UPDATE_HID_INDICATORS_UUID ZMK_BT_SPLIT_UUID(0x00000004)
 #define ZMK_SPLIT_BT_SELECT_PHYS_LAYOUT_UUID ZMK_BT_SPLIT_UUID(0x00000005)
 #define ZMK_SPLIT_BT_INPUT_EVENT_UUID ZMK_BT_SPLIT_UUID(0x00000006)
+
+/* Torabo additions start at 0xa0 so upstream can keep extending its own run of
+ * numbers without ever colliding with this fork.
+ * 0xa0: the central pushes the two kscan debounce windows it was given over
+ * BLE, so the peripheral scans with the same numbers (DESIGN-timing.md). */
+#define ZMK_SPLIT_BT_UPDATE_DEBOUNCE_UUID ZMK_BT_SPLIT_UUID(0x000000a0)

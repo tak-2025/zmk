@@ -25,6 +25,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/split/transport/peripheral.h>
 #include <zmk/split/bluetooth/uuid.h>
 #include <zmk/split/bluetooth/service.h>
+#include <zmk/torabo_timing.h>
 
 #include "peripheral.h"
 
@@ -139,6 +140,43 @@ static ssize_t split_svc_get_selected_phys_layout(struct bt_conn *conn,
     return bt_gatt_attr_read(conn, attrs, buf, len, offset, &selected, sizeof(selected));
 }
 
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_DEBOUNCE_SYNC)
+
+/* [0] = debounce-press-ms, [1] = debounce-release-ms. Deliberately not persisted:
+ * the central re-sends on every connect, so there is one source of truth and no
+ * way for the two halves to drift apart across a reflash. */
+#define SPLIT_DEBOUNCE_LEN 2
+
+static uint8_t split_debounce_ms[SPLIT_DEBOUNCE_LEN];
+
+static void split_svc_update_debounce_callback(struct k_work *work) {
+    LOG_DBG("Applying debounce %d/%d ms after GATT write", split_debounce_ms[0],
+            split_debounce_ms[1]);
+    zmk_torabo_debounce_split_apply(split_debounce_ms[0], split_debounce_ms[1]);
+}
+
+static K_WORK_DEFINE(split_svc_update_debounce_work, split_svc_update_debounce_callback);
+
+static ssize_t split_svc_update_debounce(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                                         const void *buf, uint16_t len, uint16_t offset,
+                                         uint8_t flags) {
+    if (offset + len > SPLIT_DEBOUNCE_LEN) {
+        return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+    }
+
+    memcpy(split_debounce_ms + offset, buf, len);
+
+    // Both windows change together, so wait for the pair rather than scan for a
+    // moment with the new press window and the old release one.
+    if (offset + len == SPLIT_DEBOUNCE_LEN) {
+        k_work_submit(&split_svc_update_debounce_work);
+    }
+
+    return len;
+}
+
+#endif // IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_DEBOUNCE_SYNC)
+
 #if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
 
 static void split_input_events_ccc(const struct bt_gatt_attr *attr, uint16_t value) {
@@ -204,8 +242,15 @@ BT_GATT_SERVICE_DEFINE(
     BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(ZMK_SPLIT_BT_SELECT_PHYS_LAYOUT_UUID),
                            BT_GATT_CHRC_WRITE | BT_GATT_CHRC_READ,
                            BT_GATT_PERM_WRITE_ENCRYPT | BT_GATT_PERM_READ_ENCRYPT,
-                           split_svc_get_selected_phys_layout, split_svc_select_phys_layout,
-                           NULL), );
+                           split_svc_get_selected_phys_layout, split_svc_select_phys_layout, NULL),
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_DEBOUNCE_SYNC)
+    // Torabo extension, kept last so the attribute indices the notify paths above
+    // hard-code (attrs[1], attrs[8]) do not move whether or not it is built in.
+    BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(ZMK_SPLIT_BT_UPDATE_DEBOUNCE_UUID),
+                           BT_GATT_CHRC_WRITE_WITHOUT_RESP, BT_GATT_PERM_WRITE_ENCRYPT, NULL,
+                           split_svc_update_debounce, NULL),
+#endif // IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_DEBOUNCE_SYNC)
+);
 
 K_THREAD_STACK_DEFINE(service_q_stack, CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_STACK_SIZE);
 

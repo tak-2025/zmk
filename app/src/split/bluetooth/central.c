@@ -33,6 +33,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/pointing/input_split.h>
 #include <zmk/hid_indicators_types.h>
 #include <zmk/physical_layouts.h>
+#include <zmk/torabo_timing.h>
 
 static int start_scanning(void);
 
@@ -60,6 +61,9 @@ struct peripheral_slot {
     uint16_t update_hid_indicators;
 #endif // IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
     uint16_t selected_physical_layout_handle;
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_DEBOUNCE_SYNC)
+    uint16_t update_debounce_handle;
+#endif // IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_DEBOUNCE_SYNC)
     uint8_t position_state[POSITION_STATE_DATA_LEN];
     uint8_t changed_positions[POSITION_STATE_DATA_LEN];
 };
@@ -219,6 +223,9 @@ int release_peripheral_slot(int index) {
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
     slot->update_hid_indicators = 0;
 #endif // IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_DEBOUNCE_SYNC)
+    slot->update_debounce_handle = 0;
+#endif // IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_DEBOUNCE_SYNC)
 
     return 0;
 }
@@ -535,6 +542,67 @@ static void update_peripherals_selected_physical_layout(struct k_work *_work) {
 K_WORK_DEFINE(update_peripherals_selected_layouts_work,
               update_peripherals_selected_physical_layout);
 
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_DEBOUNCE_SYNC)
+
+/* Torabo: the debounce windows the app writes reach the central's own kscan
+ * directly, but each half scans its own matrix — so hand them to the peripherals
+ * too. Same shape as the physical layout above: push on every write, and again
+ * when a peripheral's characteristic turns up during discovery, which is what
+ * makes reconnecting enough and lets the peripheral store nothing. */
+static int update_peripheral_debounce(struct peripheral_slot *slot, uint8_t press_ms,
+                                      uint8_t release_ms) {
+    if (slot->state != PERIPHERAL_SLOT_STATE_CONNECTED) {
+        return -ENOTCONN;
+    }
+
+    if (slot->update_debounce_handle == 0) {
+        // Either discovery has not reached the characteristic yet (the push from
+        // there will cover it), or this peripheral's firmware predates it.
+        return -EAGAIN;
+    }
+
+    if (bt_conn_get_security(slot->conn) < BT_SECURITY_L2) {
+        return -EAGAIN;
+    }
+
+    const uint8_t payload[] = {press_ms, release_ms};
+
+    int err = bt_gatt_write_without_response(slot->conn, slot->update_debounce_handle, payload,
+                                             sizeof(payload), true);
+
+    if (err < 0) {
+        LOG_ERR("Failed to write debounce windows to peripheral (err %d)", err);
+    }
+
+    return err;
+}
+
+static void update_peripherals_debounce(struct k_work *_work) {
+    uint8_t press_ms, release_ms;
+    if (!zmk_torabo_debounce_split_values(&press_ms, &release_ms)) {
+        // Nothing has been written on this keyboard, so there is nothing to
+        // override the peripheral's own devicetree values with.
+        return;
+    }
+
+    for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
+        if (peripherals[i].state != PERIPHERAL_SLOT_STATE_CONNECTED) {
+            continue;
+        }
+
+        update_peripheral_debounce(&peripherals[i], press_ms, release_ms);
+    }
+}
+
+K_WORK_DEFINE(update_peripherals_debounce_work, update_peripherals_debounce);
+
+/* Strong definition of the __weak seam in src/torabo_timing.c. Called from the
+ * timing module on whichever thread took the write, so hand it to the system
+ * workqueue rather than doing GATT from there. */
+void zmk_torabo_debounce_split_push(void) { k_work_submit(&update_peripherals_debounce_work); }
+
+#endif // IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_DEBOUNCE_SYNC)
+
 static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
                                                  const struct bt_gatt_attr *attr,
                                                  struct bt_gatt_discover_params *params) {
@@ -620,6 +688,13 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
             LOG_DBG("Found update HID indicators handle");
             slot->update_hid_indicators = bt_gatt_attr_value_handle(attr);
 #endif // IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_DEBOUNCE_SYNC)
+        } else if (!bt_uuid_cmp(((struct bt_gatt_chrc *)attr->user_data)->uuid,
+                                BT_UUID_DECLARE_128(ZMK_SPLIT_BT_UPDATE_DEBOUNCE_UUID))) {
+            LOG_DBG("Found update debounce handle");
+            slot->update_debounce_handle = bt_gatt_attr_value_handle(attr);
+            k_work_submit(&update_peripherals_debounce_work);
+#endif // IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_DEBOUNCE_SYNC)
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
         } else if (!bt_uuid_cmp(((struct bt_gatt_chrc *)attr->user_data)->uuid,
                                 BT_UUID_BAS_BATTERY_LEVEL)) {
@@ -695,6 +770,13 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
     subscribed = subscribed && slot->update_hid_indicators;
 #endif // IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_DEBOUNCE_SYNC)
+    // A peripheral whose firmware predates this characteristic simply never
+    // satisfies it, and discovery runs to the end of the service instead of
+    // stopping early. Everything else is already set by then, so the only cost
+    // is a slightly longer discovery.
+    subscribed = subscribed && slot->update_debounce_handle;
+#endif // IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_DEBOUNCE_SYNC)
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
     subscribed = subscribed && slot->batt_lvl_subscribe_params.value_handle;
 #endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING) */

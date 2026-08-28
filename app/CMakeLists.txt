@@ -24,6 +24,9 @@ zephyr_syscall_header(${APPLICATION_SOURCE_DIR}/include/drivers/ext_power.h)
 # find_package(Zephyr) which defines the target.
 target_include_directories(app PRIVATE include)
 target_sources(app PRIVATE src/stdlib.c)
+# Stock-behavior __weak defaults for the torabo timing override points. Always
+# compiled (central AND peripheral): the kscan debounce seam exists on both.
+target_sources(app PRIVATE src/torabo_timing.c)
 target_sources(app PRIVATE src/activity.c)
 target_sources(app PRIVATE src/behavior.c)
 target_sources_ifdef(CONFIG_ZMK_KSCAN_SIDEBAND_BEHAVIORS app PRIVATE src/kscan_sideband_behaviors.c)

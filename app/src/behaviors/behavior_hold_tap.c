@@ -18,6 +18,8 @@
 #include <zmk/events/position_state_changed.h>
 #include <zmk/events/keycode_state_changed.h>
 #include <zmk/behavior.h>
+#include <zmk/torabo_timing.h>
+#include <string.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -67,10 +69,31 @@ struct behavior_hold_tap_config {
     int32_t hold_trigger_key_positions[];
 };
 
+/* Torabo runtime timing (docs/DESIGN-timing.md): storage for ONE node's live
+ * config. It is a real `struct behavior_hold_tap_config` followed by room for
+ * the trailing hold_trigger_key_positions[] flexible array, so the rest of this
+ * file can keep using an ordinary `const struct behavior_hold_tap_config *`
+ * and never knows the difference.
+ *
+ * The bytes are declared as a plain aligned buffer rather than by embedding the
+ * config struct in a wrapper: a struct with a flexible array member is not
+ * allowed to be a member of another struct in ISO C, and the byte buffer costs
+ * nothing to read through the pointer we hand out. (Accessing it as the struct
+ * type is the usual "storage for an object" idiom, and Zephyr compiles with
+ * -fno-strict-aliasing regardless.) */
+#define ZMK_TORABO_HT_EFF_SIZE                                                                     \
+    (sizeof(struct behavior_hold_tap_config) + ZMK_TORABO_HT_MAX_POSITIONS * sizeof(int32_t))
+
 struct behavior_hold_tap_data {
 #if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_METADATA)
     struct behavior_parameter_metadata_set set;
 #endif // IS_ENABLED(CONFIG_ZMK_BEHAVIOR_METADATA)
+    /* Torabo: this instance's effective-config storage (see above), plus the
+     * parameters it was last built from so a repeated press with unchanged
+     * settings does not rewrite a buffer an already-held hold-tap points at. */
+    struct behavior_hold_tap_config *torabo_eff;
+    struct zmk_torabo_ht_params torabo_eff_params;
+    bool torabo_eff_valid;
 };
 
 // this data is specific for each hold-tap
@@ -603,16 +626,110 @@ static void update_hold_status_for_retro_tap(uint32_t ignore_position) {
     }
 }
 
+/* ---- Torabo runtime timing (docs/DESIGN-timing.md) -----------------------
+ *
+ * One seam, taken once per press. `zmk_torabo_ht_override` is __weak and says
+ * "no" unless the torabo timing module is compiled in and the user has actually
+ * written a config, so a stock build takes the `return dt_cfg` path below and
+ * behaves exactly as before.
+ *
+ * The returned pointer is stored in active_hold_tap->config by store_hold_tap,
+ * which is the latch the design asks for: everything decide_hold_tap() and
+ * release_binding() read afterwards comes from this one snapshot, so a setting
+ * written while a key is undecided cannot change the rules mid-decision. */
+static const struct behavior_hold_tap_config *
+torabo_effective_config(const struct device *dev, const struct behavior_hold_tap_config *dt_cfg) {
+    struct behavior_hold_tap_data *data = dev->data;
+    if (data == NULL || data->torabo_eff == NULL) {
+        return dt_cfg;
+    }
+
+    struct zmk_torabo_ht_params p;
+    if (!zmk_torabo_ht_override(dev, &p)) {
+        return dt_cfg;
+    }
+
+    /* Unchanged since the last build? Hand back the buffer as it stands. This
+     * matters: an earlier press of the same node may still be held and pointing
+     * at it, and rewriting identical bytes would be pure risk for no gain. */
+    if (data->torabo_eff_valid && memcmp(&data->torabo_eff_params, &p, sizeof(p)) == 0) {
+        return data->torabo_eff;
+    }
+
+    struct behavior_hold_tap_config *eff = data->torabo_eff;
+
+    /* The two behavior device names are structural (they are what `&mt`/`&lt`
+     * invoke), never tunable — carry them straight over. Same for the linger
+     * flag, which wire v1 deliberately leaves alone. */
+    eff->hold_behavior_dev = dt_cfg->hold_behavior_dev;
+    eff->tap_behavior_dev = dt_cfg->tap_behavior_dev;
+    eff->hold_while_undecided_linger = dt_cfg->hold_while_undecided_linger;
+
+    eff->tapping_term_ms = (int)p.tapping_term_ms;
+    eff->quick_tap_ms = p.quick_tap_ms;
+    eff->require_prior_idle_ms = p.require_prior_idle_ms;
+    eff->flavor = (p.flavor <= FLAVOR_TAP_UNLESS_INTERRUPTED) ? (enum flavor)p.flavor
+                                                              : dt_cfg->flavor;
+    eff->retro_tap = (p.flags & ZMK_TORABO_HT_FLAG_RETRO_TAP) != 0;
+    eff->hold_trigger_on_release = (p.flags & ZMK_TORABO_HT_FLAG_HOLD_TRIGGER_ON_RELEASE) != 0;
+    eff->hold_while_undecided = (p.flags & ZMK_TORABO_HT_FLAG_HOLD_WHILE_UNDECIDED) != 0;
+
+    uint8_t n = MIN(p.pos_count, (uint8_t)ZMK_TORABO_HT_MAX_POSITIONS);
+    for (uint8_t i = 0; i < n; i++) {
+        eff->hold_trigger_key_positions[i] = (int32_t)p.positions[i];
+    }
+    eff->hold_trigger_key_positions_len = n;
+
+    data->torabo_eff_params = p;
+    data->torabo_eff_valid = true;
+    return eff;
+}
+
+/* Tell the timing module what this instance's devicetree values are, so a READ
+ * can answer with the real built-in defaults before anything has been written.
+ * __weak no-op without the module. */
+static void torabo_report_dt(const struct device *dev) {
+    const struct behavior_hold_tap_config *cfg = dev->config;
+    struct zmk_torabo_ht_params p = {
+        .tapping_term_ms = (uint16_t)CLAMP(cfg->tapping_term_ms, 0, UINT16_MAX),
+        .quick_tap_ms = cfg->quick_tap_ms,
+        .require_prior_idle_ms = cfg->require_prior_idle_ms,
+        .flavor = (uint8_t)cfg->flavor,
+        .flags = (uint8_t)((cfg->retro_tap ? ZMK_TORABO_HT_FLAG_RETRO_TAP : 0) |
+                           (cfg->hold_trigger_on_release
+                                ? ZMK_TORABO_HT_FLAG_HOLD_TRIGGER_ON_RELEASE
+                                : 0) |
+                           (cfg->hold_while_undecided ? ZMK_TORABO_HT_FLAG_HOLD_WHILE_UNDECIDED
+                                                      : 0)),
+    };
+
+    /* The wire carries positions as bytes; a devicetree position that does not
+     * fit is dropped rather than truncated into a wrong key. */
+    for (int32_t i = 0; i < cfg->hold_trigger_key_positions_len &&
+                        p.pos_count < ZMK_TORABO_HT_MAX_POSITIONS;
+         i++) {
+        int32_t pos = cfg->hold_trigger_key_positions[i];
+        if (pos < 0 || pos > UINT8_MAX) {
+            continue;
+        }
+        p.positions[p.pos_count++] = (uint8_t)pos;
+    }
+
+    zmk_torabo_ht_report_dt(dev->name, &p);
+}
+
 static int on_hold_tap_binding_pressed(struct zmk_behavior_binding *binding,
                                        struct zmk_behavior_binding_event event) {
     const struct device *dev = zmk_behavior_get_binding(binding->behavior_dev);
-    const struct behavior_hold_tap_config *cfg = dev->config;
 
     if (undecided_hold_tap != NULL) {
         LOG_DBG("ERROR another hold-tap behavior is undecided.");
         // if this happens, make sure the behavior events occur AFTER other position events.
         return ZMK_BEHAVIOR_OPAQUE;
     }
+
+    // Torabo: latch the live timing for this press (falls back to devicetree).
+    const struct behavior_hold_tap_config *cfg = torabo_effective_config(dev, dev->config);
 
     struct active_hold_tap *hold_tap =
         store_hold_tap(&event, binding->param1, binding->param2, cfg);
@@ -854,10 +971,15 @@ static int behavior_hold_tap_init(const struct device *dev) {
         }
     }
     init_first_run = false;
+
+    // Torabo: hand this instance's devicetree defaults to the timing module.
+    torabo_report_dt(dev);
     return 0;
 }
 
 #define KP_INST(n)                                                                                 \
+    static uint8_t behavior_hold_tap_torabo_eff_##n[ZMK_TORABO_HT_EFF_SIZE]                        \
+        __aligned(__alignof__(struct behavior_hold_tap_config));                                   \
     static const struct behavior_hold_tap_config behavior_hold_tap_config_##n = {                  \
         .tapping_term_ms = DT_INST_PROP(n, tapping_term_ms),                                       \
         .hold_behavior_dev = DEVICE_DT_NAME(DT_INST_PHANDLE_BY_IDX(n, bindings, 0)),               \
@@ -874,7 +996,10 @@ static int behavior_hold_tap_init(const struct device *dev) {
         .hold_trigger_key_positions = DT_INST_PROP(n, hold_trigger_key_positions),                 \
         .hold_trigger_key_positions_len = DT_INST_PROP_LEN(n, hold_trigger_key_positions),         \
     };                                                                                             \
-    static struct behavior_hold_tap_data behavior_hold_tap_data_##n = {};                          \
+    static struct behavior_hold_tap_data behavior_hold_tap_data_##n = {                            \
+        .torabo_eff =                                                                              \
+            (struct behavior_hold_tap_config *)behavior_hold_tap_torabo_eff_##n,                   \
+    };                                                                                             \
     BEHAVIOR_DT_INST_DEFINE(n, behavior_hold_tap_init, NULL, &behavior_hold_tap_data_##n,          \
                             &behavior_hold_tap_config_##n, POST_KERNEL,                            \
                             CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &behavior_hold_tap_driver_api);
